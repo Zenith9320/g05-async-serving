@@ -1,0 +1,15 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+
+# Env / secrets (AK/SK, HF_TOKEN etc. must never be committed)
+.env
+
+# Model weights & checkpoints (large binaries, kept out of git)
+checkpoints/
+*.pt
+*.safetensors
+*.bin
