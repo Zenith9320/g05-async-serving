@@ -135,7 +135,9 @@ def main():
     policy, processor = _sp.setup(cfg, device=args.device)
     inferencer = _sp.PolicyInferencer(policy, processor, device=args.device)
 
-    wrapper = _sp.ChunkedPolicyWrapper(inferencer, processor, action_steps=args.action_steps)
+    wrapper = _sp.ChunkedPolicyWrapper(
+        _sp._make_compute_chunk(inferencer, processor), action_steps=args.action_steps
+    )
     records, wall = asyncio.run(
         run_wrapper(wrapper, processor, args.steps, args.rate, args.task, args.verbose)
     )
@@ -143,7 +145,9 @@ def main():
 
     if args.compare_rtc:
         print("\n[harness] running RTC baseline (action_steps=1)...")
-        wrapper_rtc = _sp.ChunkedPolicyWrapper(inferencer, processor, action_steps=1)
+        wrapper_rtc = _sp.ChunkedPolicyWrapper(
+            _sp._make_compute_chunk(inferencer, processor), action_steps=1
+        )
         records_rtc, wall_rtc = asyncio.run(
             run_wrapper(wrapper_rtc, processor, args.steps, args.rate, args.task, args.verbose)
         )

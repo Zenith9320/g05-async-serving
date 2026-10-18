@@ -55,6 +55,8 @@ from g05.models.g05.inferencer import (
 
 import websockets
 
+from chunked_policy import ChunkedPolicyWrapper
+
 logger = logging.getLogger(__name__)
 
 
@@ -322,64 +324,21 @@ def _serialize_error(code: int, message: str) -> dict[str, Any]:
     return {"error": {"code": code, "message": message}}
 
 
-class ChunkedPolicyWrapper:
-    """Wraps model inference with chunk caching and step-by-step serving.
+def _make_compute_chunk(inferencer, processor):
+    """Build the async ``compute`` callable expected by ``ChunkedPolicyWrapper``.
 
-    One instance per client connection.
-
-    Plan B (async look-ahead, receding horizon): the *first* chunk is served in
-    full (``chunk_len`` steps = the model's action horizon); each subsequent
-    chunk is served only for its *last* ``action_steps`` steps — the fresh half
-    that lies beyond the previously executed chunk. The next chunk's inference
-    is launched in the background from a fresh observation collected every
-    ``action_steps`` steps, so its latency is hidden behind the current chunk's
-    tail and the swap at the chunk boundary does not stall. Blocking at the
-    boundary is the timeout fallback when inference overruns the tail.
-
-    Args:
-        inferencer: PolicyInferencer for direct model inference.
-        processor: processor for building obs dicts.
-        action_steps: control period in steps — a fresh observation is collected
-            and the next chunk's inference is launched every ``action_steps``
-            steps. The first chunk serves ``chunk_len`` steps; subsequent chunks
-            serve only their last ``action_steps`` steps.
-            1 = RTC (recompute every call), >1 = chunk look-ahead mode.
+    ``compute(raw_obs) -> (chunk_dict, cot_text)`` runs the real model inference
+    in a worker thread and postprocesses the result back into numpy chunk arrays
+    (``chunk_dict`` maps each action part to ``ndarray[chunk_len, dim]``).
     """
 
-    def __init__(self, inferencer, processor, *, action_steps: int = 16):
-        self.inferencer = inferencer
-        self.processor = processor
-        self.action_steps = action_steps
-        self._cached_chunk = None  # {part: ndarray[chunk_len, dim]}
-        self._chunk_step = 0       # next step index to serve from _cached_chunk
-        self._chunk_len = 0        # steps in _cached_chunk (0 = none)
-        self._next_task = None     # asyncio.Task computing the next chunk, or None
-        self._cot_text = None      # str or None, from the most recent chunk
-
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _chunk_len_of(chunk: dict) -> int:
-        """Number of steps in a chunk dict (leading dim of the first array part)."""
-        for arr in chunk.values():
-            if isinstance(arr, np.ndarray) and arr.ndim >= 1:
-                return int(arr.shape[0])
-        return 0
-
-    async def _compute_chunk(self, raw_obs: dict) -> tuple[dict, str | None]:
-        """Build obs, run inference (in a worker thread), and postprocess.
-
-        Returns ``(chunk_dict, cot_text)`` where ``chunk_dict`` maps each action
-        part to ``ndarray[chunk_len, dim]``.
-        """
+    async def compute(raw_obs: dict) -> tuple[dict, str | None]:
         if not raw_obs:
             raise ValueError("need obs for recompute but got empty")
         t0 = time.monotonic()
         _parse_task_and_plan(raw_obs)
-        obs_dict = build_obs_dict(raw_obs, self.processor)
-        actions = await asyncio.to_thread(self.inferencer.infer, [obs_dict])
+        obs_dict = build_obs_dict(raw_obs, processor)
+        actions = await asyncio.to_thread(inferencer.infer, [obs_dict])
         action = actions[0]
         cot_text = action.pop("_cot_text", None)
         # Drop keys the AR head did not confidently predict. The protocol returns
@@ -401,106 +360,11 @@ class ChunkedPolicyWrapper:
         logger.info(
             "Recompute: %.1fms (chunk %d steps)",
             (time.monotonic() - t0) * 1000,
-            self._chunk_len_of(chunk),
+            ChunkedPolicyWrapper._chunk_len_of(chunk),
         )
         return chunk, cot_text
 
-    # ------------------------------------------------------------------
-    # API
-    # ------------------------------------------------------------------
-
-    @property
-    def need_obs(self) -> bool:
-        """Whether the next call to get_action needs a real observation.
-
-        True when no chunk exists yet, when the current chunk is exhausted (the
-        next call swaps in the pending chunk *and* needs a fresh observation to
-        launch the following chunk), or when the observation-collection trigger
-        has been reached and the next chunk's inference has not been launched yet.
-        False while serving from cache or while a pending inference is running
-        (the client can then send an empty observation).
-        """
-        if self._cached_chunk is None:
-            return True
-        if self._chunk_step >= self._chunk_len:
-            return True
-        if self._next_task is not None:
-            return False
-        return self._chunk_step >= self.action_steps
-
-    async def get_action(self, raw_obs: dict) -> tuple[dict, str | None]:
-        """Return single-step action ``{part: ndarray[dim]}``."""
-        rtc = self.action_steps == 1
-
-        if self._cached_chunk is None:
-            # First chunk: nothing to serve while we wait, so compute synchronously.
-            self._cached_chunk, self._cot_text = await self._compute_chunk(raw_obs)
-            self._chunk_len = self._chunk_len_of(self._cached_chunk)
-            self._chunk_step = 0
-        elif rtc:
-            # RTC: recompute synchronously on every call (original behavior).
-            if self._chunk_step >= self.action_steps:
-                self._cached_chunk, self._cot_text = await self._compute_chunk(raw_obs)
-                self._chunk_len = self._chunk_len_of(self._cached_chunk)
-                self._chunk_step = 0
-        else:
-            # Chunk look-ahead (receding horizon). Lookahead only helps when the
-            # chunk is longer than the control period (a tail of steps to execute
-            # after the observation trigger); otherwise fall back to synchronous
-            # recompute at the chunk boundary.
-            lookahead = self._chunk_len > self.action_steps
-            if self._chunk_step >= self._chunk_len:
-                # Chunk exhausted: swap in the pending async chunk. Blocking here
-                # is the timeout fallback (inference overran the tail).
-                if lookahead and self._next_task is not None:
-                    task = self._next_task
-                    self._next_task = None
-                    self._cached_chunk, self._cot_text = await task
-                else:
-                    self._cached_chunk, self._cot_text = await self._compute_chunk(raw_obs)
-                self._chunk_len = self._chunk_len_of(self._cached_chunk)
-                # Subsequent chunks serve only their last ``action_steps`` steps
-                # (the fresh half beyond the previous chunk). Their first
-                # ``action_steps`` steps re-plan the chunk we just finished and
-                # are already executed, so skip them.
-                self._chunk_step = self.action_steps
-            # Launch the next chunk's inference from a fresh observation once the
-            # trigger is reached. This fires mid-chunk for the first chunk, and
-            # immediately after a swap for subsequent chunks (whose served window
-            # already starts at ``action_steps``).
-            if (
-                lookahead
-                and self._chunk_step >= self.action_steps
-                and self._next_task is None
-                and raw_obs
-            ):
-                self._next_task = asyncio.create_task(self._compute_chunk(raw_obs))
-
-        single_step = {}
-        for part, arr in self._cached_chunk.items():
-            if arr.ndim >= 1 and self._chunk_step < arr.shape[0]:
-                single_step[part] = arr[self._chunk_step]
-            else:
-                single_step[part] = arr[0] if arr.ndim >= 1 else arr
-        self._chunk_step += 1
-        return single_step, self._cot_text
-
-    def reset(self):
-        """Invalidate cache and cancel any pending inference (episode boundary)."""
-        self._cancel_pending()
-        self._cached_chunk = None
-        self._chunk_step = 0
-        self._chunk_len = 0
-        self._cot_text = None
-
-    def close(self):
-        """Cancel any pending inference (connection teardown)."""
-        self._cancel_pending()
-
-    def _cancel_pending(self):
-        if self._next_task is not None and not self._next_task.done():
-            self._next_task.cancel()
-        self._next_task = None
+    return compute
 
 
 async def handler(ws, inferencer, processor, action_steps=16):
@@ -513,7 +377,9 @@ async def handler(ws, inferencer, processor, action_steps=16):
     logger.info(f"Client connected: {client} (action_steps={action_steps})")
 
     await ws.send(packb({"action_steps": action_steps}))
-    policy = ChunkedPolicyWrapper(inferencer, processor, action_steps=action_steps)
+    policy = ChunkedPolicyWrapper(
+        _make_compute_chunk(inferencer, processor), action_steps=action_steps
+    )
 
     try:
         async for msg in ws:
@@ -535,7 +401,9 @@ async def handler(ws, inferencer, processor, action_steps=16):
                 logger.exception("Inference request failed")
                 await ws.send(packb(_serialize_error(500, str(exc))))
             dt = (time.monotonic() - t0) * 1000
-            logger.debug(f"{'Infer' if policy._chunk_step == 1 else 'Cache'}: {dt:.1f}ms")
+            logger.debug(
+                f"{'Infer' if policy._chunk_step - policy._serve_start == 1 else 'Cache'}: {dt:.1f}ms"
+            )
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"Client disconnected: {client}")
     finally:
