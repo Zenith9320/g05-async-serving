@@ -4,6 +4,8 @@ Galaxea **G0.5 VLA**（YAM 双臂机器人）的**异步前瞻（look-ahead）�
 
 单次模型推理约需 **1.5 s**（开发机估计；前瞻能藏住的上限是 0.53 s，须在工控机实测，见 §8），而机器人需以 **30 Hz**（YAM 训练数据的相机对齐帧率）连续控制。本项目采用**分块滚动时域（receding horizon / "Plan B"）**方案：一次推理生成一整段未来动作，机器人逐帧回放的同时后台提前计算下一段，从而把推理延迟藏起来。
 
+> **动作生成模式：AR（离散 ActionCodec）**。本仓库部署使用 G0.5 的 **AR 头**出动作，不使用 FM（连续 flow matching）。切法是关 FM、留 AR：`model.model_arch.continuous_action=false`（`discrete_action` 保持 `true`）。AR 模式下动作来自 ActionCodec 解码，`_absent_keys`（不置信部件）作为唯一动作来源的置信度掩码——被 `serve_policy` 丢弃、客户端保持上一帧值。§6 所有加载模型的命令都已带此开关。
+
 ---
 
 ## 目录
@@ -212,14 +214,16 @@ cd /path/to/GalaxeaVLA          # 以 GalaxeaVLA 为工作目录（稳妥起见�
 # 6.1 离线 chunk 时序测试
 python /path/to/g05-async-serving/offline_chunk_harness.py \
     --ckpt_path checkpoints/g05-base/checkpoints/model_state_dict.pt \
-    --action_steps 16 --steps 64 --rate 30 [--compare_rtc]
+    --action_steps 16 --steps 64 --rate 30 [--compare_rtc] \
+    model.model_arch.continuous_action=false
 
 # 6.2 端到端 WS 测试
 # 终端 1 —— 服务器
 python /path/to/g05-async-serving/serve_policy.py \
     --ckpt_path checkpoints/g05-base/checkpoints/model_state_dict.pt \
     --host 127.0.0.1 --port 8765 \
-    eval_embodiment=galaxea_r1lite model.model_weights_to_bf16=true
+    eval_embodiment=galaxea_r1lite model.model_weights_to_bf16=true \
+    model.model_arch.continuous_action=false
 
 # 终端 2 —— 客户端
 python /path/to/g05-async-serving/fake_policy_client.py \
@@ -239,7 +243,8 @@ python -m pytest tests/ -v
 cd /path/to/GalaxeaVLA
 python /path/to/g05-async-serving/offline_eval.py \
     --ckpt_path checkpoints/g05-base/checkpoints/model_state_dict.pt \
-    --action_steps 16 --eval_split train [--steps 128 --max_episodes 5]
+    --action_steps 16 --eval_split train [--steps 128 --max_episodes 5] \
+    model.model_arch.continuous_action=false
 ```
 
 > 数据集目录从 checkpoint 的 run-dir config 读（已指向 `data/yam/...`，见 §4.4）；数据未下载时会在此步报错。**YAM 的 `val_set_proportion=1e-4`，val 几乎为空，所以用 `--eval_split train`**（开环对训练集是乐观上界，只做"动作误差不要太大"的 sanity check）。产物 `offline_eval_results.json`（已 gitignore）。
@@ -254,6 +259,7 @@ python /path/to/g05-async-serving/offline_eval.py \
 4. **换段点（step 32）是否 SLOW**：这是 Plan B 成没成的直接判据。
 5. **`frequency` 字段**：真实机器人客户端必须显式发 `frequency`（服务端缺省是 15，YAM 应是 30）。
 6. **`action_steps` 对齐**：`action_steps = obs_stride × (control_fps / data_fps)`，与实际控制频率、训练数据帧率一致，避免分布漂移。
+7. **AR 动作 sanity check**：AR 模式下动作完全来自 ActionCodec 解码，先跑 `offline_chunk_harness.py` 冒烟，确认输出动作的量级/符号正常（YAM 的 6 个关节必须匹配 R1-Lite 的顺序与符号），再上真机。
 
 ## 8. 如何根据 GPU 推理时间定 `action_steps`
 
