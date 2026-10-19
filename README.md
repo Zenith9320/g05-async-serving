@@ -30,7 +30,6 @@ Galaxea **G0.5 VLA**（YAM 双臂机器人）的**异步前瞻（look-ahead）�
 | `chunked_policy.py` | `ChunkedPolicyWrapper`：分块缓存 + 后台前瞻的**状态机**。无 torch/g05 依赖，可单独 import 单测。 |
 | `fake_policy_client.py` | 合成观测客户端（端到端 WS 测试）。模拟真实机器人协议：按固定频率发真实观测/空观测，遵守 `need_obs` 握手。 |
 | `offline_chunk_harness.py` | 离线 chunk 时序测试。不走网络，直接驱动 `ChunkedPolicyWrapper`，单独验证分块/前瞻的时序逻辑。 |
-| `offline_eval.py` | 真实数据离线对比：baseline（同步整段重算，G05 原始方式）vs 前瞻，各报「每步服务延迟 + T_infer（卡顿）」和「动作 vs 专家真值 L1（成功率代理）」。 |
 | `tests/` | 无 GPU 单元测试（`test_codec.py` / `test_build_obs.py` / `test_chunked_wrapper.py`），用 pytest 跑。 |
 | `conftest.py` | pytest 引导：把仓库根加进 `sys.path`，让测试能 import 同级脚本。 |
 | `.python-version` | Python 版本标记（3.10.16），供 `rootutils.setup_root` 定位项目根。 |
@@ -103,14 +102,6 @@ Galaxea **G0.5 VLA**（YAM 双臂机器人）的**异步前瞻（look-ahead）�
 
 > 慢阈值 `SLOW_MS = 20`，任何一步 ≥ 20 ms 会被标成 SLOW 并打印。
 
-### 3.5 真实数据离线对比（`offline_eval.py`）
-
-- **目的**：不碰真机，用转好的 LeRobot 数据（`tools/yam/mcap_to_lerobot.py` 的产出）量化「原始方式 vs 前瞻」在**卡顿**和**动作误差**两个轴上的取舍。
-- **内容**：同一批 episode，分别用 `action_steps=chunk_len`（baseline）和 `action_steps=16`（前瞻）两个 `ChunkedPolicyWrapper` 跑，逐帧报：
-  - 卡顿：每步服务延迟（mean/p50/p95/max + SLOW 步数）和 `T_infer`（单次推理延迟）。
-  - 成功率代理：服务动作 vs 专家真值（`/action/accepted`）的 L1，按身体部件分。
-- **边界**：这是**开环代理不是成功率**——没有环境反馈，动作误差只能做「不要太大」的 sanity check；卡顿的绝对值必须工控机重跑（dev 机 GPU 不同）。
-
 ## 4. 运行依赖（重要）
 
 本仓库是"服务 + 测试"这一**薄层**，运行依赖 **GalaxeaVLA** 仓库（提供 `g05` 包、configs、checkpoints）。
@@ -131,44 +122,6 @@ Galaxea **G0.5 VLA**（YAM 双臂机器人）的**异步前瞻（look-ahead）�
    ```
 
 3. **GPU + CUDA**：模型推理需要 GPU（默认 `device=cuda`）。
-
-4. **LeRobot 数据集**（真实数据，`offline_eval.py` 需要；位置 `GalaxeaVLA/data/yam/`）：
-
-   `configs/data/yam.yaml` 的 `dataset_dirs` 指向下面 10 个任务目录，每个都是一个 LeRobot v3 数据集（`meta/info.json` + `data/` + `videos/`）：
-
-   ```
-   GalaxeaVLA/data/yam/
-   ├── TASK-YAM-0001_lerobot/
-   ├── TASK-YAM-0002_lerobot/
-   ├── TASK-YAM-0004_lerobot/
-   ├── TASK-YAM-0006_lerobot/
-   ├── TASK-YAM-0007_lerobot/
-   ├── TASK-YAM-0008_lerobot/
-   ├── TASK-YAM-0010_lerobot/
-   ├── TASK-YAM-0013_lerobot/
-   ├── TASK-YAM-0014_lerobot/
-   └── TASK-YAM-0015_lerobot/
-   ```
-
-   **从 Hugging Face 下载**（`<org>/<repo>` 替换成你的仓库）：
-
-   ```bash
-   cd GalaxeaVLA
-   # gated/私有仓库先登录或 export HF_TOKEN（切勿写进代码/提交）
-   huggingface-cli login            # 或 export HF_TOKEN=...
-   huggingface-cli download <org>/<repo> --repo-type dataset --local-dir data/yam
-   ```
-
-   若每个任务是单独一个 HF 仓库，则逐个下载到对应目录：
-
-   ```bash
-   huggingface-cli download <org>/TASK-YAM-0001 --repo-type dataset \
-       --local-dir data/yam/TASK-YAM-0001_lerobot
-   ```
-
-   **或自行转换**：`GalaxeaVLA/tools/yam/mcap_to_lerobot.py --output-root data/yam`（从 MCAP 转，无需下载）。
-
-   下载后校验：每个目录里有 `meta/info.json`，且 `dataset_dirs` 里 10 个路径都存在。
 
 ## 5. 环境配置与创建（miniforge）
 
@@ -238,28 +191,51 @@ cd /path/to/g05-async-serving
 python -m pytest tests/ -v
 ```
 
+## 7. 工控机测试清单
+
+开发机与工控机 GPU 不同，**时序数字不能直接迁移**。上工控机后按下述顺序逐项确认（`action_steps` 的估算流程见 §8）：
+
+### 7.1 环境 / 资源自检（最基础）
+
+- `g05` 可 import、GPU 可见、CUDA 版本正确。
+- checkpoints 就位、模型能正常加载。
+- **VRAM 够不够装模型**：不够用 `model.model_weights_to_bf16=true`，或减小 batch/视野。
+
+### 7.2 端到端 WS 链路（协议 / 链路轴）
+
 ```bash
-# 6.4 真实数据离线对比（baseline vs 前瞻；需 GPU + 已下载的 LeRobot 数据）
-cd /path/to/GalaxeaVLA
-python /path/to/g05-async-serving/offline_eval.py \
+# 终端 1 —— 服务器
+python serve_policy.py \
     --ckpt_path checkpoints/g05-base/checkpoints/model_state_dict.pt \
-    --action_steps 16 --eval_split train [--steps 128 --max_episodes 5] \
-    model.model_arch.continuous_action=false
+    --host 127.0.0.1 --port 8765 \
+    eval_embodiment=galaxea_r1lite model.model_arch.continuous_action=false
+# 终端 2 —— 客户端
+python fake_policy_client.py --host 127.0.0.1 --port 8765 --steps 64 --rate 30
 ```
 
-> 数据集目录从 checkpoint 的 run-dir config 读（已指向 `data/yam/...`，见 §4.4）；数据未下载时会在此步报错。**YAM 的 `val_set_proportion=1e-4`，val 几乎为空，所以用 `--eval_split train`**（开环对训练集是乐观上界，只做"动作误差不要太大"的 sanity check）。产物 `offline_eval_results.json`（已 gitignore）。
+验证：msgpack 编解码、`need_obs` 握手、`action_steps` 宣告、异步 serving、`frequency` 字段，在工控机 GPU 环境下整条链路走通。`offline_chunk_harness.py` 只测 chunk 状态机（不过网络），这一步补上完整链路。
 
-## 7. 工控机上需要确认的内容
+### 7.3 时序：推理延迟 vs look-ahead 窗口（`action_steps`）
 
-开发机与工控机 GPU 不同，**时序数字不能直接迁移**。上工控机后逐项确认：
+实测工控机 GPU 单次推理延迟 `T_infer`，确认 ≤ **0.53 s**（30 Hz 下 16 步窗口）。若 `T_infer` > 0.53 s，换段必掉进超时兜底——解法是加速推理或加长 `chunk_len`，**调 `action_steps` 救不了**（16 已经是 `chunk_len=32` 下能取到的最大窗口）。完整估算 + 验证指令见 **§8**。
 
-1. **控制频率**：客户端 `--rate` 与 `frequency` 字段 = 实际控制频率（YAM 目标 30 Hz）。
-2. **推理延迟 vs look-ahead 窗口**：实测工控机 GPU 的单次推理延迟 `T_infer`，确认是否 ≤ **0.53 s**（30 Hz 下 16 步 = 0.53 s，推导见 §8）。若 `T_infer` > 0.53 s，换段必掉进超时兜底——解法在加速推理或加长 `chunk_len`，**调 `action_steps` 救不了**（16 已经是 chunk_len=32 下能取到的最大窗口）。
-3. **VRAM 够不够装模型**：不够用 `model.model_weights_to_bf16=true`，或减小 batch/视野。
-4. **换段点（step 32）是否 SLOW**：这是 Plan B 成没成的直接判据。
-5. **`frequency` 字段**：真实机器人客户端必须显式发 `frequency`（服务端缺省是 15，YAM 应是 30）。
-6. **`action_steps` 对齐**：`action_steps = obs_stride × (control_fps / data_fps)`，与实际控制频率、训练数据帧率一致，避免分布漂移。
-7. **AR 动作 sanity check**：AR 模式下动作完全来自 ActionCodec 解码，先跑 `offline_chunk_harness.py` 冒烟，确认输出动作的量级/符号正常（YAM 的 6 个关节必须匹配 R1-Lite 的顺序与符号），再上真机。
+### 7.4 AR 动作正确性（动作轴 ★最关键）
+
+AR 模式下动作完全来自 ActionCodec 解码，正确性取决于 **slot 对齐**：YAM 的 6 个关节 + 2 个夹爪在 codec 的 27 维 slot 里，**顺序/符号必须与 R1-Lite 一致**，否则不是"不准"而是"直接崩"（符号反、量级错）。
+
+- **怎么测**：喂真实观测（真机相机 + 关节，或一段录制的 MCAP），看输出动作的**量级合理、符号正确**。
+- 注：仓库里已无真数据校验脚本（`offline_eval.py` 已删），这块只能靠真机实测，或临时喂一段真实观测人工看输出。
+
+### 7.5 真机 IO + 频率（数据轴）
+
+- **3 路相机**：`head_rgb` / `left_wrist_rgb` / `right_wrist_rgb` 能采到，shape `3×480×640` uint8。
+- **关节读数**：`left_arm[6] + left_gripper[1] + right_arm[6] + right_gripper[1]` 的顺序/符号与模型 schema 一致（也是 7.4 的 slot 对齐一部分）。
+- **控制频率**：客户端 `--rate` 与实际控制频率 = 30 Hz；`frequency` 字段必须显式发（服务端缺省是 15，YAM 应是 30）。
+- **`action_steps` 对齐**：`action_steps = obs_stride × (control_fps / data_fps)`，与实际控制频率、训练数据帧率一致，避免分布漂移。
+
+### 7.6 安全状态机（上真机前最优先）
+
+实验室的 `scripts/safety`（SAFE HOLD / gravity / off）——上真机前先确认急停与软限位可用。这与模型无关，但比任何测试都优先。
 
 ## 8. 如何根据 GPU 推理时间定 `action_steps`
 
@@ -301,6 +277,40 @@ action_steps = obs_stride × (control_fps / data_fps)
 ```
 
 即"每次重规划对应的观测间隔"要和训练数据一致，否则有分布漂移。默认 16 在 YAM（30 Hz、obs_steps=1）下同时满足窗口最大与数据对齐。**若要让 `action_steps` 成为真正可调参数（例如为更快的闭环响应取 8），代码已支持任意 `1 ≤ action_steps ≤ chunk_len/2`**（见 `chunked_policy.py` 的 `_serve_start`/`_serve_len` 实现与 `tests/test_chunked_wrapper.py::test_general_action_steps_contiguous`）。
+
+### 8.4 具体指令（工控机上实测）
+
+**第 1 步：量 `T_infer`（单次推理延迟）**
+
+```bash
+cd /path/to/GalaxeaVLA
+python /path/to/g05-async-serving/offline_chunk_harness.py \
+    --ckpt_path checkpoints/g05-base/checkpoints/model_state_dict.pt \
+    --action_steps 1 --steps 8 --rate 0 \
+    model.model_arch.continuous_action=false
+```
+
+`--action_steps 1` 即 RTC，每一步都是一次完整推理；汇总里的 `first-step latency (inference baseline)` 就是 `T_infer`。多跑几次取中位数，避开首次模型加载 / `torch.compile`。
+
+**第 2 步：套充要条件**
+
+```
+T_infer ≤ (chunk_len − action_steps) / 30 Hz = (32 − action_steps) / 30
+```
+
+- `T_infer ≤ 0.53 s`（建议留余量 `≤ 0.45 s`）→ `action_steps=16` 成立，换段 ≈ 0 ms。
+- `T_infer > 0.53 s` → 调 `action_steps` 无解（16 已是最大窗口），只能加速推理（bf16 / `torch.compile` / 减视野或 batch）。
+
+**第 3 步：验证换段点**
+
+```bash
+python /path/to/g05-async-serving/offline_chunk_harness.py \
+    --ckpt_path checkpoints/g05-base/checkpoints/model_state_dict.pt \
+    --action_steps 16 --steps 64 --rate 30 \
+    model.model_arch.continuous_action=false
+```
+
+看 **step 32（换段）**：≈ 0 ms 说明藏住了；标 `SLOW`（≥20 ms）说明 `T_infer` 超了窗口，回到第 1 步。
 
 ## 9. 关键参数与频率说明
 
