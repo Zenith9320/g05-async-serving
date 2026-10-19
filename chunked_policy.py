@@ -111,12 +111,11 @@ class ChunkedPolicyWrapper:
             self._serve_len = self._chunk_len
         elif rtc:
             # RTC: recompute synchronously on every call (original behavior).
-            if self._chunk_step >= self._serve_start + self._serve_len:
-                self._cached_chunk, self._cot_text = await self._compute_chunk(raw_obs)
-                self._chunk_len = self._chunk_len_of(self._cached_chunk)
-                self._chunk_step = 0
-                self._serve_start = 0
-                self._serve_len = self._chunk_len
+            self._cached_chunk, self._cot_text = await self._compute_chunk(raw_obs)
+            self._chunk_len = self._chunk_len_of(self._cached_chunk)
+            self._chunk_step = 0
+            self._serve_start = 0
+            self._serve_len = 1
         else:
             # Chunk look-ahead (receding horizon). Requires an overlap window and a
             # fresh window to both fit in the chunk horizon: chunk_len >= 2*action_steps.

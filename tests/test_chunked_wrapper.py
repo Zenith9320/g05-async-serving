@@ -29,9 +29,8 @@ class RampCompute:
         self.calls += 1
         self.got_real_obs.append(bool(raw_obs))
         base = float(raw_obs.get("__step__", 0.0))
-        arr = (base + np.arange(self.chunk_len, dtype=np.float32)).reshape(
-            self.chunk_len, self.dim
-        )
+        ramp = base + np.arange(self.chunk_len, dtype=np.float32)
+        arr = np.tile(ramp[:, None], (1, self.dim))
         return {"action": arr}, None
 
 
@@ -122,17 +121,18 @@ def test_rtc_recomputes_every_step():
 
 
 def test_sync_fallback_serves_fresh_window():
-    # If the client fails to send a real obs at the trigger (step 16), no
-    # background launch happens; at the swap the wrapper recomputes synchronously
-    # from the *current* obs and serves its first action_steps steps. The action
-    # stream must stay contiguous (the old code served the wrong future window).
+    # If the client fails to send a real obs at the trigger (step 16), the launch
+    # is skipped; the wrapper re-requests obs and re-launches at the next real obs
+    # (step 17), so the swap at step 32 still uses a background chunk (no stall).
+    # The action stream must stay contiguous (the old code served the wrong future
+    # window).
     fc = RampCompute(chunk_len=32)
     wrapper = ChunkedPolicyWrapper(fc, action_steps=16)
     served, _ = asyncio.run(drive(wrapper, 64, empty_at={16}))
 
     assert served == list(map(float, range(64)))
-    # chunk 0 (step 0) + synchronous recomputes at swaps (32, 48) => 3 inferences
-    assert fc.calls == 3
+    # chunk 0 (step 0) + re-launch at step 17 + background launches at 33, 48 => 4
+    assert fc.calls == 4
 
 
 def test_reset_clears_cache():
